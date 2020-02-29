@@ -40,7 +40,7 @@ import numpy
 from openquake.baselib import hdf5
 from openquake.baselib.node import node_from_elem, Node as N, context
 from openquake.baselib.general import (groupby, group_array, duplicated,
-                                       add_defaults, AccumDict)
+                                       add_defaults, AccumDict, CallableDict)
 import openquake.hazardlib.source as ohs
 from openquake.hazardlib.gsim.mgmpe.avg_gmpe import AvgGMPE
 from openquake.hazardlib.gsim.base import CoeffsTable
@@ -245,6 +245,143 @@ def tomldict(ddic):
     return out
 
 
+apply_uncertainty = CallableDict(lambda bset: bset.uncertainty_type)
+
+
+@apply_uncertainty.add('simpleFaultDipRelative')
+def a1(bset, source, value):
+    source.modify('adjust_dip', dict(increment=value))
+
+
+@apply_uncertainty.add('simpleFaultDipAbsolute')
+def a2(bset, source, value):
+    source.modify('set_dip', dict(dip=value))
+
+
+@apply_uncertainty.add('simpleFaultGeometryAbsolute')
+def a3(bset, source, value):
+    trace, usd, lsd, dip, spacing = value
+    source.modify(
+        'set_geometry',
+        dict(fault_trace=trace, upper_seismogenic_depth=usd,
+             lower_seismogenic_depth=lsd, dip=dip, spacing=spacing))
+
+
+@apply_uncertainty.add('complexFaultGeometryAbsolute')
+def a4(bset, source, value):
+    edges, spacing = value
+    source.modify('set_geometry', dict(edges=edges, spacing=spacing))
+
+
+@apply_uncertainty.add('characteristicFaultGeometryAbsolute')
+def a5(bset, source, value):
+    source.modify('set_geometry', dict(surface=value))
+
+
+@apply_uncertainty.add('abGRAbsolute')
+def a6(bset, source, value):
+    a, b = value
+    source.mfd.modify('set_ab', dict(a_val=a, b_val=b))
+
+
+@apply_uncertainty.add('bGRRelative')
+def a7(bset, source, value):
+    source.mfd.modify('increment_b', dict(value=value))
+
+
+@apply_uncertainty.add('maxMagGRRelative')
+def a8(bset, source, value):
+    source.mfd.modify('increment_max_mag', dict(value=value))
+
+
+@apply_uncertainty.add('maxMagGRAbsolute')
+def a9(bset, source, value):
+    source.mfd.modify('set_max_mag', dict(value=value))
+
+
+@apply_uncertainty.add('incrementalMFDAbsolute')
+def a10(bset, source, value):
+    min_mag, bin_width, occur_rates = value
+    source.mfd.modify('set_mfd', dict(min_mag=min_mag, bin_width=bin_width,
+                                      occurrence_rates=occur_rates))
+
+
+parse_uncertainty = CallableDict(
+    lambda bset: bset.uncertainty_type,
+    keymissing=lambda bset, node: float(node.text.strip()))
+
+
+@parse_uncertainty.add('sourceModel', 'extendModel')
+def f0(branchset, node):
+    return node.text.strip()
+
+
+@parse_uncertainty.add('abGRAbsolute')
+def f2(branchset, node):
+    [a, b] = node.text.strip().split()
+    return float(a), float(b)
+
+
+@parse_uncertainty.add('incrementalMFDAbsolute')
+def f3(branchset, node):
+    min_mag, bin_width = (node.incrementalMFD["minMag"],
+                          node.incrementalMFD["binWidth"])
+    return min_mag,  bin_width, ~node.incrementalMFD.occurRates
+
+
+@parse_uncertainty.add('simpleFaultGeometryAbsolute')
+def f4(branchset, node):
+    spacing = node["spacing"]
+    usd, lsd, dip = (~node.upperSeismoDepth, ~node.lowerSeismoDepth,
+                     ~node.dip)
+    # Parse the geometry
+    coords = split_coords_2d(~node.LineString.posList)
+    trace = geo.Line([geo.Point(*p) for p in coords])
+    return trace, usd, lsd, dip, spacing
+
+
+@parse_uncertainty.add('complexFaultGeometryAbsolute')
+def f5(branchset, node):
+    spacing = node["spacing"]
+    edges = []
+    for edge_node in node.nodes:
+        coords = split_coords_3d(~edge_node.LineString.posList)
+        edges.append(geo.Line([geo.Point(*p) for p in coords]))
+    return edges, spacing
+
+
+@parse_uncertainty.add('characteristicFaultGeometryAbsolute')
+def f6(branchset, node):
+    surfaces = []
+    for geom_node in node.surface:
+        if "simpleFaultGeometry" in geom_node.tag:
+            trace, usd, lsd, dip, spacing = parse_uncertainty(
+                branchset, node.simpleFaultGeometry)
+            surfaces.append(geo.SimpleFaultSurface.from_fault_data(
+                trace, usd, lsd, dip, spacing))
+        elif "complexFaultGeometry" in geom_node.tag:
+            edges, spacing = parse_uncertainty(
+                branchset, geom_node.complexFaultGeometry)
+            surfaces.append(geo.ComplexFaultSurface.from_fault_data(
+                edges, spacing))
+        elif "planarSurface" in geom_node.tag:
+            nodes = []
+            for key in ["topLeft", "topRight", "bottomRight", "bottomLeft"]:
+                nodes.append(geo.Point(getattr(node, key)["lon"],
+                                       getattr(node, key)["lat"],
+                                       getattr(node, key)["depth"]))
+                top_left, top_right, bottom_right, bottom_left = tuple(nodes)
+                surf = geo.PlanarSurface.from_corner_points(
+                    top_left, top_right, bottom_right, bottom_left)
+            surfaces.append(surf)
+        else:
+            pass
+    if len(surfaces) > 1:
+        return geo.MultiSurface(surfaces)
+    else:
+        return surfaces[0]
+
+
 class BranchSet(object):
     """
     Branchset object, represents a ``<logicTreeBranchSet />`` element.
@@ -394,76 +531,6 @@ class BranchSet(object):
         # All filters pass, return True.
         return True
 
-    def apply_uncertainty(self, value, source):
-        """
-        Apply this branchset's uncertainty with value ``value`` to source
-        ``source``, if it passes :meth:`filters <filter_source>`.
-
-        This method is not called for uncertainties of types "gmpeModel"
-        and "sourceModel".
-
-        :param value:
-            The actual uncertainty value of :meth:`sampled <sample>` branch.
-            Type depends on uncertainty type.
-        :param source:
-            The opensha source data object.
-        :return:
-            0 if the source was not changed, 1 otherwise
-        """
-        if not self.filter_source(source):
-            # source didn't pass the filter
-            return 0
-        if self.uncertainty_type in MFD_UNCERTAINTY_TYPES:
-            self._apply_uncertainty_to_mfd(source.mfd, value)
-        elif self.uncertainty_type in GEOMETRY_UNCERTAINTY_TYPES:
-            self._apply_uncertainty_to_geometry(source, value)
-        else:
-            raise AssertionError("unknown uncertainty type '%s'"
-                                 % self.uncertainty_type)
-        return 1
-
-    def _apply_uncertainty_to_geometry(self, source, value):
-        """
-        Modify ``source`` geometry with the uncertainty value ``value``
-        """
-        if self.uncertainty_type == 'simpleFaultDipRelative':
-            source.modify('adjust_dip', dict(increment=value))
-        elif self.uncertainty_type == 'simpleFaultDipAbsolute':
-            source.modify('set_dip', dict(dip=value))
-        elif self.uncertainty_type == 'simpleFaultGeometryAbsolute':
-            trace, usd, lsd, dip, spacing = value
-            source.modify(
-                'set_geometry',
-                dict(fault_trace=trace, upper_seismogenic_depth=usd,
-                     lower_seismogenic_depth=lsd, dip=dip, spacing=spacing))
-        elif self.uncertainty_type == 'complexFaultGeometryAbsolute':
-            edges, spacing = value
-            source.modify('set_geometry', dict(edges=edges, spacing=spacing))
-        elif self.uncertainty_type == 'characteristicFaultGeometryAbsolute':
-            source.modify('set_geometry', dict(surface=value))
-
-    def _apply_uncertainty_to_mfd(self, mfd, value):
-        """
-        Modify ``mfd`` object with uncertainty value ``value``.
-        """
-        if self.uncertainty_type == 'abGRAbsolute':
-            a, b = value
-            mfd.modify('set_ab', dict(a_val=a, b_val=b))
-
-        elif self.uncertainty_type == 'bGRRelative':
-            mfd.modify('increment_b', dict(value=value))
-
-        elif self.uncertainty_type == 'maxMagGRRelative':
-            mfd.modify('increment_max_mag', dict(value=value))
-
-        elif self.uncertainty_type == 'maxMagGRAbsolute':
-            mfd.modify('set_max_mag', dict(value=value))
-
-        elif self.uncertainty_type == 'incrementalMFDAbsolute':
-            min_mag, bin_width, occur_rates = value
-            mfd.modify('set_mfd', dict(min_mag=min_mag, bin_width=bin_width,
-                                       occurrence_rates=occur_rates))
-
     def __repr__(self):
         return repr(self.branches)
 
@@ -516,6 +583,11 @@ def collect_info(smlt):
 
 
 def get_paths(smlt, fnames):
+    """
+    :param smlt: absolute path to source_model_logic_tree file
+    :param fnames: a list of relative paths to source models
+    :return: absolute paths to source models
+    """
     base_path = os.path.dirname(smlt)
     paths = []
     for fname in fnames:
@@ -685,7 +757,7 @@ class SourceModelLogicTree(object):
             if validate:
                 self.validate_uncertainty_value(
                     value_node, branchnode, branchset)
-            value = self.parse_uncertainty_value(value_node, branchset)
+            value = parse_uncertainty(branchset, value_node)
             branch_id = branchnode.attrib.get('branchID')
             branch = Branch(bs_id, branch_id, weight, value)
             if branch_id in self.branches:
@@ -740,90 +812,6 @@ class SourceModelLogicTree(object):
                 yield Realization(name, weight, ordinal,
                                   tuple(smlt_branch_ids), 1)
                 ordinal += 1
-
-    def parse_uncertainty_value(self, node, branchset):
-        """
-        See superclass' method for description and signature specification.
-
-        Doesn't change source model file name, converts other values to either
-        pair of floats or a single float depending on uncertainty type.
-        """
-        if branchset.uncertainty_type in ('sourceModel', 'extendModel'):
-            return node.text.strip()
-        elif branchset.uncertainty_type == 'abGRAbsolute':
-            [a, b] = node.text.strip().split()
-            return float(a), float(b)
-        elif branchset.uncertainty_type == 'incrementalMFDAbsolute':
-            min_mag, bin_width = (node.incrementalMFD["minMag"],
-                                  node.incrementalMFD["binWidth"])
-            return min_mag,  bin_width, ~node.incrementalMFD.occurRates
-        elif branchset.uncertainty_type == 'simpleFaultGeometryAbsolute':
-            return self._parse_simple_fault_geometry_surface(
-                node.simpleFaultGeometry)
-        elif branchset.uncertainty_type == 'complexFaultGeometryAbsolute':
-            return self._parse_complex_fault_geometry_surface(
-                node.complexFaultGeometry)
-        elif branchset.uncertainty_type ==\
-                'characteristicFaultGeometryAbsolute':
-            surfaces = []
-            for geom_node in node.surface:
-                if "simpleFaultGeometry" in geom_node.tag:
-                    trace, usd, lsd, dip, spacing =\
-                        self._parse_simple_fault_geometry_surface(geom_node)
-                    surfaces.append(geo.SimpleFaultSurface.from_fault_data(
-                        trace, usd, lsd, dip, spacing))
-                elif "complexFaultGeometry" in geom_node.tag:
-                    edges, spacing =\
-                        self._parse_complex_fault_geometry_surface(geom_node)
-                    surfaces.append(geo.ComplexFaultSurface.from_fault_data(
-                        edges, spacing))
-                elif "planarSurface" in geom_node.tag:
-                    surfaces.append(
-                        self._parse_planar_geometry_surface(geom_node))
-                else:
-                    pass
-            if len(surfaces) > 1:
-                return geo.MultiSurface(surfaces)
-            else:
-                return surfaces[0]
-        else:
-            return float(node.text.strip())
-
-    def _parse_simple_fault_geometry_surface(self, node):
-        """
-        Parses a simple fault geometry surface
-        """
-        spacing = node["spacing"]
-        usd, lsd, dip = (~node.upperSeismoDepth, ~node.lowerSeismoDepth,
-                         ~node.dip)
-        # Parse the geometry
-        coords = split_coords_2d(~node.LineString.posList)
-        trace = geo.Line([geo.Point(*p) for p in coords])
-        return trace, usd, lsd, dip, spacing
-
-    def _parse_complex_fault_geometry_surface(self, node):
-        """
-        Parses a complex fault geometry surface
-        """
-        spacing = node["spacing"]
-        edges = []
-        for edge_node in node.nodes:
-            coords = split_coords_3d(~edge_node.LineString.posList)
-            edges.append(geo.Line([geo.Point(*p) for p in coords]))
-        return edges, spacing
-
-    def _parse_planar_geometry_surface(self, node):
-        """
-        Parses a planar geometry surface
-        """
-        nodes = []
-        for key in ["topLeft", "topRight", "bottomRight", "bottomLeft"]:
-            nodes.append(geo.Point(getattr(node, key)["lon"],
-                                   getattr(node, key)["lat"],
-                                   getattr(node, key)["depth"]))
-        top_left, top_right, bottom_right, bottom_left = tuple(nodes)
-        return geo.PlanarSurface.from_corner_points(
-            top_left, top_right, bottom_right, bottom_left)
 
     def validate_uncertainty_value(self, node, branchnode, branchset):
         """
@@ -1149,9 +1137,11 @@ class SourceModelLogicTree(object):
             for i, src_group in enumerate(sm.src_groups):
                 sg = copy.deepcopy(src_group)  # do not change the original
                 for source in sg:
-                    changes = sum(
-                        branchset.apply_uncertainty(value, source)
-                        for branchset, value in branchsets_and_uncertainties)
+                    changes = 0
+                    for branchset, value in branchsets_and_uncertainties:
+                        if branchset.filter_source(source):
+                            apply_uncertainty(branchset, source, value)
+                            changes += 1
                     if changes:  # redoing count_ruptures can be slow
                         source.num_ruptures = source.count_ruptures()
                         newsm.changes += changes
